@@ -29,3 +29,28 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class ClaimPayload(BaseModel):
+    """归属请求：执行编号必填；数据项缺省时按该执行已领取/缺失范围处理。"""
+
+    execution: str
+    items: list[str] = Field(default_factory=list)
+    source: str | None = None
+    checksum: str | None = None
+    reason: str | None = None
+
+
+class HandoffScopePayload(BaseModel):
+    execution: str
+    handoff_code: str | None = None
+    target_system: str = "datalake_downstream"
+    items: list[str] = Field(default_factory=list)
+    pack_id: int | None = None
+    reason: str | None = None
+
+
+class HandoffActionPayload(BaseModel):
+    """继续/确认交接只需要补充说明；执行与范围由交接记录自身决定。"""
+
+    reason: str | None = None

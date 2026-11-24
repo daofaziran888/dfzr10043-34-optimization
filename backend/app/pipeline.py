@@ -24,6 +24,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from app.scope import ScopeError, scope_ledger
 from app.services import service_for
 
 # ── 通用工具 ──────────────────────────────────────────────────
@@ -49,6 +50,17 @@ def _find_entry(module: str, entry_id: int) -> dict[str, Any]:
     if entry is None:
         raise RuntimeError(f"{module} {entry_id} 不存在")
     return entry
+
+
+def _unique_code(svc, base: str, field: str) -> str:
+    """业务编号冲突时追加序号，避免同一执行多次归集覆盖同一批次编号。"""
+    existing = {str(row.get(field, "")) for row in svc.list_entries(size=100000)[0]}
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base}-{index}" in existing:
+        index += 1
+    return f"{base}-{index}"
 
 
 # ── 链路1: 流程模板发布 → 排程触发 → 任务队列派发 → 机器人节点执行 → 步骤轨迹 ─
@@ -146,9 +158,19 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
 # ── 链路2: 文件归集校验 → 采集批次确认 → 字段映射生效 → 数据落库 → 交接包消费 ─
 
 def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]],
-                                 mapping_ids: list[int]) -> dict[str, Any]:
-    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。"""
+                                 mapping_ids: list[int],
+                                 execution: str | None = None,
+                                 receipt_items: list[str] | None = None,
+                                 upstream_source: str | None = None) -> dict[str, Any]:
+    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。
+
+    共享来源：同一上游来源可以被多个执行复用。同一个来源文件再次进入时，
+    不再整批拒绝，而是复用已有回执 / 批次，把本次执行领取的数据项登记到
+    独立的归属上（execution 缺省取执行编号）。批次去重只针对“完全相同的
+    执行 + 来源 + 数据项”重复回执，合法归属不会被丢掉。
+    """
     run_entry = _find_entry("flow_run", run_id)
+    execution_code = str(execution or run_entry.get("执行编号", "")).strip()
 
     # 文件归集
     file_svc = service_for("file_drop")
@@ -178,29 +200,89 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     )
     batch_checksum = _checksum(batch_payload)
 
-    # 去重：按采集窗口+上游来源判重，重复批次不落库
-    existing = batch_svc.list_entries(size=10000)[0]
-    dup_check = f"{run_entry.get('执行编号')}:{run_id}"
-    duplicate = any(
-        e.get("上游来源") == dup_check
-        for e in existing
-    )
-    if duplicate:
-        return {"status": "duplicate", "reason": "采集窗口与上游来源重复，批次已存在"}
+    # 上报来源：显式传入的上游来源优先，否则用执行+来源文件指纹。
+    # 同一来源在不同执行下是共享来源，不能因为“来源相同”就判重。
+    source_files = "|".join(fp.get("文件名称", "") for fp in file_payloads)
+    dup_check = upstream_source or f"{run_entry.get('执行编号')}:{source_files}"
 
-    batch_values = {
-        "批次编号": f"CAPT-R{run_id}",
-        "关联执行": run_entry.get("执行编号", ""),
-        "记录行数": str(len(collected)),
-        "采集窗口": f"[{_now_iso()[:10]}]",
-        "完整性校验": batch_checksum,
-        "批次标签": "file-collect",
-        "上游来源": dup_check,
-        "生成时间": _now_iso(),
-    }
-    batch_result, _ = batch_svc.create_entry(batch_values)
-    batch_svc.run_action(batch_result["id"], "启动校验")
-    batch_svc.run_action(batch_result["id"], "确认批次")
+    # 数据项：缺省按归集文件逐项登记；调用方可显式给出领用清单。
+    items = receipt_items or [fp.get("文件名称", "") for fp in file_payloads]
+
+    existing = batch_svc.find_by_source(dup_check)
+    if existing is None:
+        batch_values = {
+            "批次编号": _unique_code(
+                batch_svc, f"CAPT-R{run_id}", "批次编号"),
+            "关联执行": run_entry.get("执行编号", ""),
+            "记录行数": str(len(collected)),
+            "采集窗口": f"[{_now_iso()[:10]}]",
+            "完整性校验": batch_checksum,
+            "批次标签": "file-collect",
+            "上游来源": dup_check,
+            "回执编号": "",
+            "归集数据项": "",
+            "归属执行": "",
+            "最新确认编号": "",
+            "生成时间": _now_iso(),
+        }
+        batch_result, _ = batch_svc.create_entry(batch_values)
+        batch_svc.run_action(batch_result["id"], "启动校验")
+        batch_svc.run_action(batch_result["id"], "确认批次")
+        batch_id = int(batch_result["id"])
+        batch_code = batch_values["批次编号"]
+        reused = False
+        batch_svc.register_receipt(
+            batch_id, items, source=dup_check, checksum=batch_checksum)
+    else:
+        batch_id = int(existing["id"])
+        batch_code = str(existing.get("批次编号", ""))
+        batch_result = existing
+        reused = True
+        # 复用共享回执：把本次来源出现的数据项补进回执，已有确认/撤回不回退。
+        batch_svc.register_receipt(
+            batch_id, items, source=dup_check, checksum=batch_checksum)
+
+    # 归属：同一回执可以被多个执行共享，每个执行各自领用。
+    # 同一执行对同一回执的相同领取是幂等重复，返回 duplicate；不影响其他执行。
+    # 但若该执行已经撤回其中某项，旧领用不能再把撤回项带出来——必须走补采。
+    prior_claim = scope_ledger.get_claim(batch_code, execution_code)
+    if prior_claim is not None:
+        prior_items = prior_claim.get("领取范围", [])
+        withdrawn = set(prior_claim.get("撤回范围", []))
+        reintroduced = [item for item in items if item in withdrawn]
+        if set(prior_items) == set(items) and prior_claim.get("确认范围") \
+                and not reintroduced:
+            return {
+                "status": "duplicate",
+                "reason": "该执行已领用同一回执的相同数据项，未重复落库",
+                "batch_id": batch_id,
+                "batch_code": batch_code,
+                "execution": execution_code,
+            }
+        if reintroduced:
+            return {
+                "status": "rejected",
+                "reason": (
+                    f"数据项已撤回，不能再用旧领用带出：{'、'.join(reintroduced)}；"
+                    "请通过补采恢复缺失范围"),
+                "batch_id": batch_id,
+                "batch_code": batch_code,
+                "execution": execution_code,
+            }
+
+    try:
+        claim = batch_svc.claim_scope(
+            batch_id, execution_code, items, reason="归集领用确认")
+    except ScopeError as exc:
+        # 撤回过的数据项不能再用旧领用带出：返回可读拒绝，由值班员补采。
+        return {
+            "status": "rejected",
+            "reason": str(exc),
+            "batch_id": batch_id,
+            "batch_code": batch_code,
+            "execution": execution_code,
+        }
+    confirmation_id = claim.get("确认编号", "")
 
     # 字段映射生效
     mapping_svc = service_for("field_mapping")
@@ -215,8 +297,9 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     conflict_rows = max(0, raw_row_count % 3)  # 模拟冲突
     watermark = int(datetime.now(timezone(timedelta(hours=8))).timestamp())
     landing_values = {
-        "落库编号": f"LAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
+        "落库编号": _unique_code(
+            landing_svc, f"LAND-R{run_id}-{execution_code}", "落库编号"),
+        "关联批次": batch_code,
         "目标存储": "datalake_rpa_collect",
         "写入模式": "upsert",
         "写入行数": str(raw_row_count),
@@ -225,33 +308,55 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
         "完成时间": _now_iso(),
     }
     landing_result, _ = landing_svc.create_entry(landing_values)
-    landing_svc.run_action(landing_result["id"], "启动写入")
-    if conflict_rows == 0:
-        landing_svc.run_action(landing_result["id"], "确认写入")
-    else:
-        landing_svc.run_action(landing_result["id"], "标记异常")
+    if landing_result is not None:
+        landing_svc.run_action(landing_result["id"], "启动写入")
+        if conflict_rows == 0:
+            landing_svc.run_action(landing_result["id"], "确认写入")
+        else:
+            landing_svc.run_action(landing_result["id"], "标记异常")
 
-    # 交接包打包
+    # 交接包打包：范围跟随本次实际确认的归属，而不是整个回执。
     handoff_svc = service_for("handoff_pack")
-    handoff_values = {
-        "交接编号": f"HAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
+    handoff_code = _unique_code(
+        handoff_svc, f"HAND-R{run_id}-{execution_code}", "交接编号")
+    pack_values = {
+        "交接编号": handoff_code,
+        "关联批次": batch_code,
         "目标系统": "datalake_downstream",
-        "清单文件数": str(len(collected)),
+        "清单文件数": str(len(claim.get("确认范围", []))),
         "记录行数": str(raw_row_count - conflict_rows),
         "校验摘要": batch_checksum,
         "交接版本": "v1",
         "交接时间": _now_iso(),
+        "执行编号": execution_code,
+        "交接数据项": "",
+        "交接状态": "",
+        "挂起原因": "",
     }
-    handoff_result, _ = handoff_svc.create_entry(handoff_values)
-    handoff_svc.run_action(handoff_result["id"], "启动打包")
-    handoff_svc.run_action(handoff_result["id"], "确认交接")
+    handoff_result, _ = handoff_svc.create_entry(pack_values)
+    handoff_id = int(handoff_result["id"]) if handoff_result else 0
+    handoff_svc.run_action(handoff_id, "启动打包")
+    handoff_svc.open_handoff(
+        batch_id, execution_code, handoff_code, "datalake_downstream",
+        items=list(claim.get("确认范围", [])), pack_id=handoff_id,
+        reason="归集确认后发起交接")
+    # 交接包停在打包中，由交接方核对接收清单后再确认；
+    # 这样撤回归属时才有“已经领取的交接”可以挂起。
+    handoff_status = "打包中"
 
     return {
         "status": "landed",
-        "batch_id": batch_result["id"],
-        "landing_id": landing_result["id"],
-        "handoff_id": handoff_result["id"],
+        "batch_id": batch_id,
+        "batch_code": batch_code,
+        "receipt_code": claim.get("回执编号", ""),
+        "execution": execution_code,
+        "confirmed_scope": list(claim.get("确认范围", [])),
+        "confirmation_id": confirmation_id,
+        "landing_id": landing_result["id"] if landing_result else None,
+        "handoff_id": handoff_id,
+        "handoff_code": handoff_code,
+        "handoff_status": handoff_status,
+        "reused_receipt": reused,
         "conflict_rows": conflict_rows,
         "watermark": watermark,
     }
